@@ -58,7 +58,7 @@ def load_ptn(dataset_path: str) -> Ptn:
         dest = int(row[col_dest])
         demand = float(row[col_demand])
         if demand > 0 and origin != dest:
-            #scale demand by 5 to make it more realistic
+            # scale demand by 5 to make it more realistic
             od_pairs[(origin, dest)] = 5 * demand
 
     cost_file = os.path.join(dataset_path, 'Pool-Cost.giv')
@@ -73,7 +73,7 @@ def load_ptn(dataset_path: str) -> Ptn:
         line_costs[line_id] = cost
 
     edge_mapping = {
-        int(row['edge-id']): (int(row['left-stop-id']), int(row['right-stop-id']), row['length'])
+        int(row['edge-id']): (int(row['left-stop-id']), int(row['right-stop-id']), 0.5 * (float(row['lower-bound']) + float(row['upper-bound'])))
         for _, row in edges_df.iterrows()}
     pool = pd.read_csv(dataset_path + '/Pool.giv', sep=';', comment='#',
                        skipinitialspace=True)
@@ -122,16 +122,9 @@ def generate_subpaths(pool: dict, edge_mapping: dict, stops) -> dict:
         for start_idx in range(n - 1):
             t_L = 0
             origin = nodes[start_idx]
-            skipping = True
             for end_idx in range(start_idx + 1, n):
                 t_L += weights[end_idx - 1]
-
                 destination = nodes[end_idx]
-                if skipping and end_idx < (n - 1) and lines_at_stop[origin] <= lines_at_stop[destination]:
-                    continue
-
-                skipping = False
-
                 subpaths.append({
                     'line_id': line_id,
                     'entry_node': origin,
@@ -164,11 +157,12 @@ def build_model(ptn: Ptn, subpaths: dict,
     lines = ptn.lines.keys()
     edges = list(ptn.edge_mapping.values())
     od_time = {(i, j): k for i, dest in shortest_paths.items() for (j, k) in dest.items()
-              if (i, j) in od_pairs.keys()}
+               if (i, j) in od_pairs.keys()}
     model = pyo.ConcreteModel(name="Simultaneous_Line_Planning")
+    lines_at_edge = {e: [l for l, line_edges in ptn.lines.items() if e in [ptn.edge_mapping[eid] for eid in line_edges]] for e in edges}
 
     print("Sets...")
-    model.E = pyo.Set(initialize=edges, dimen=3)
+    model.E = pyo.Set(initialize=edges, dimen=3, doc="Transit Edges")
     model.S = pyo.Set(initialize=list(G.nodes()), doc="Transit Nodes")
     model.L = pyo.Set(initialize=list(lines), doc="Line Pool")
     model.PathIndex = pyo.Set(initialize=subpaths.keys(), dimen=3, doc="Line Pool")
@@ -187,7 +181,7 @@ def build_model(ptn: Ptn, subpaths: dict,
     model.demand = pyo.Param(model.R, initialize=od_pairs, default=0, doc="Demand")
     model.time = pyo.Param(model.PathIndex, initialize=subpaths, doc="Subpath Lengths")
     model.line_costs = pyo.Param(model.L, initialize=line_costs, doc="Line Costs")
-
+    model.fMax = pyo.Param(initialize=20, doc="Maximum number of vehicles per edge")
 
     def weight_rule(m, l, a, b, s, t):
         if a == s and b != t:
@@ -206,13 +200,11 @@ def build_model(ptn: Ptn, subpaths: dict,
     model.f = pyo.Var(model.L, domain=pyo.NonNegativeIntegers)
     model.x = pyo.Var(model.PathIndex, model.R, domain=pyo.NonNegativeReals)
 
-
     def objective_rule(m):
         return sum(m.x[i, w] * m.omega[i, w] for i in m.PathIndex for w in m.R)
 
     print("Objective...")
     model.Objective = pyo.Objective(rule=objective_rule, sense=pyo.maximize)
-
 
     def flow_conservation_rule(m, node, origin, dest):
         w = (origin, dest)
@@ -237,7 +229,6 @@ def build_model(ptn: Ptn, subpaths: dict,
     print("Flow Conservation...")
     model.FlowCons = pyo.Constraint(model.S, model.R, rule=flow_conservation_rule)
 
-
     def line_capacity_rule(m, l, a, b):
         i = (l, a, b)
         total_passengers_on_subpath = sum(m.x[i, w] for w in m.R)
@@ -246,6 +237,15 @@ def build_model(ptn: Ptn, subpaths: dict,
     print("Line Capacity...")
     model.LineCap = pyo.Constraint(model.PathIndex, rule=line_capacity_rule)
 
+    def edge_capacity_rule(m, a, b, w):
+        e = (a, b, w)
+        expr = sum(m.f[l] for l in lines_at_edge[e]) <= m.fMax
+        if isinstance(expr, bool):
+            return pyo.Constraint.Feasible if expr else pyo.Constraint.Infeasible
+        return expr
+
+    print("Edge capacity...")
+    model.EdgeCap = pyo.Constraint(model.E, rule=edge_capacity_rule)
 
     def budget_rule(m):
         return sum(m.line_costs[l] * m.f[l] for l in m.L) <= m.B
@@ -264,8 +264,8 @@ def run_solver(model: ConcreteModel) -> Any:
         solver = pyo.SolverFactory('gurobi')
 
     solver.options['Threads'] = 0  # 0 allows Gurobi to use all available CPU cores
-    solver.options['TimeLimit'] = 300  # 5 minute absolute cutoff
-    solver.options['MIPGap'] = 0.01  # Stop when within 1% of the theoretical minimum
+    solver.options['TimeLimit'] = 3000  # 5 minute absolute cutoff
+    solver.options['MIPGap'] = 0.05  # Stop when within 5% of the theoretical minimum
 
     print("Sending model to solver...")
     results = solver.solve(model, tee=False, load_solutions=False)
@@ -274,6 +274,8 @@ def run_solver(model: ConcreteModel) -> Any:
         model.solutions.load_from(results)
     elif results.solver.termination_condition == pyo.TerminationCondition.feasible:
         input("Suboptimal solution found. Press Enter to continue...")
+    else:
+        print("Solver failed to find an optimal solution.")
 
     return results
 
@@ -291,7 +293,7 @@ def main():
         edge_mapping=ptn.edge_mapping,
         stops=list(ptn.G.nodes())
     )
-    model = build_model(ptn, subpaths, shortest_paths, 900.0, 5, 1.2, 50)
+    model = build_model(ptn, subpaths, shortest_paths, 600.0, 5, 1.2, 50)
     print("Beta = 5; Rho = 1.2")
     run_solver(model)
     print_frequencies(model, ptn.lines.keys())
@@ -300,7 +302,7 @@ def main():
     model.rho = 1.2
     run_solver(model)
     print_frequencies(model, ptn.lines.keys())
-    print("Beta = 5; Rho = 1.1")
+    print("Beta = 5; Rho = 1.05")
     model.beta = 5.0
     model.rho = 1.1
     run_solver(model)
